@@ -2,5 +2,3 @@ openai
 sounddevice
 numpy
 python-dotenv
-streamlit-mic-recorder
-pydub
