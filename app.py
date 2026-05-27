@@ -52,109 +52,6 @@ st.markdown("""
         box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
     }
     
-    .chat-container {
-        height: 600px;
-        overflow-y: auto;
-        padding: 20px;
-        background: #f8f9fa;
-        border-radius: 15px;
-        margin-bottom: 20px;
-    }
-    
-    .message {
-        margin-bottom: 15px;
-        padding: 12px 16px;
-        border-radius: 10px;
-        max-width: 80%;
-        word-wrap: break-word;
-    }
-    
-    .user-message {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        margin-left: auto;
-        text-align: right;
-        border-radius: 15px 15px 0px 15px;
-    }
-    
-    .ai-message {
-        background: #e9ecef;
-        color: #333;
-        margin-right: auto;
-        border-radius: 15px 15px 15px 0px;
-    }
-    
-    .timestamp {
-        font-size: 0.75rem;
-        opacity: 0.7;
-        margin-top: 5px;
-    }
-    
-    .status-indicator {
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        margin-right: 8px;
-        animation: pulse 2s infinite;
-    }
-    
-    .status-listening {
-        background-color: #4CAF50;
-    }
-    
-    .status-processing {
-        background-color: #FFC107;
-    }
-    
-    .status-idle {
-        background-color: #999;
-    }
-    
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-    }
-    
-    .control-button {
-        padding: 12px 24px;
-        border-radius: 10px;
-        border: none;
-        font-size: 16px;
-        font-weight: bold;
-        cursor: pointer;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-    }
-    
-    .btn-primary {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-    }
-    
-    .btn-primary:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
-    }
-    
-    .btn-danger {
-        background: #ff6b6b;
-        color: white;
-    }
-    
-    .btn-danger:hover {
-        background: #ff5252;
-        transform: translateY(-2px);
-    }
-    
-    .info-box {
-        background: #e3f2fd;
-        border-left: 4px solid #2196F3;
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-    
     .title-section {
         text-align: center;
         margin-bottom: 30px;
@@ -184,15 +81,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ========== Streamlit 세션 상태 초기화 ==========
+# ========== 세션 상태 초기화 ==========
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "is_recording" not in st.session_state:
     st.session_state.is_recording = False
 if "status" not in st.session_state:
     st.session_state.status = "대기 중..."
-if "connection" not in st.session_state:
-    st.session_state.connection = None
 
 # ========== 오디오 설정 ==========
 SAMPLE_RATE = 24000
@@ -208,7 +103,7 @@ current_ai_transcript = ""
 def mic_callback(indata, frames, time_info, status):
     """마이크 입력 콜백"""
     if status:
-        pass  # 에러 무시
+        pass
     
     global is_ai_speaking
     if is_ai_speaking:
@@ -298,23 +193,63 @@ async def run_voice_chat():
     base_url = REAL_ENDPOINT.replace("https://", "wss://").rstrip("/") + "/openai/v1"
     
     try:
+        # 사용 가능한 장치 확인
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            st.error(f"❌ 오디오 장치 조회 실패: {e}")
+            st.session_state.is_recording = False
+            return
+        
+        # 입력/출력 장치 찾기
+        input_devices = [i for i, d in enumerate(devices) if d['max_input_channels'] > 0]
+        output_devices = [i for i, d in enumerate(devices) if d['max_output_channels'] > 0]
+        
+        if not input_devices:
+            st.error("❌ 입력 장치(마이크)를 찾을 수 없습니다!")
+            st.info("💡 시스템 설정에서 마이크를 확인하세요")
+            st.session_state.is_recording = False
+            return
+        
+        if not output_devices:
+            st.error("❌ 출력 장치(스피커)를 찾을 수 없습니다!")
+            st.session_state.is_recording = False
+            return
+        
+        # 기본 장치 사용
+        default_input = input_devices[0]
+        default_output = output_devices[0]
+        
+        st.info(f"🎤 사용 중인 입력: {devices[default_input]['name']}")
+        st.info(f"🔊 사용 중인 출력: {devices[default_output]['name']}")
+        
         client = AsyncOpenAI(websocket_base_url=base_url, api_key=REAL_APIKEY)
 
-        mic_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, 
-            channels=CHANNELS, 
-            dtype='int16', 
-            blocksize=CHUNK_SIZE,
-            callback=mic_callback
-        )
-        
-        speaker_stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, 
-            channels=CHANNELS, 
-            dtype='int16',
-            blocksize=CHUNK_SIZE,
-            callback=speaker_callback
-        )
+        # 스트림 생성
+        try:
+            mic_stream = sd.InputStream(
+                device=default_input,
+                samplerate=SAMPLE_RATE, 
+                channels=CHANNELS, 
+                dtype='int16', 
+                blocksize=CHUNK_SIZE,
+                callback=mic_callback,
+                latency='low'
+            )
+            
+            speaker_stream = sd.OutputStream(
+                device=default_output,
+                samplerate=SAMPLE_RATE, 
+                channels=CHANNELS, 
+                dtype='int16',
+                blocksize=CHUNK_SIZE,
+                callback=speaker_callback,
+                latency='low'
+            )
+        except Exception as e:
+            st.error(f"❌ 스트림 생성 실패: {e}")
+            st.session_state.is_recording = False
+            return
 
         with mic_stream, speaker_stream:
             async with client.realtime.connect(model=REAL_DEPLOYMENT) as connection:
@@ -355,7 +290,7 @@ async def run_voice_chat():
         st.error(f"❌ 연결 에러: {e}")
         st.session_state.is_recording = False
 
-# ========== Streamlit UI ==========
+# ========== UI ==========
 st.markdown("""
 <div class="title-section">
     <h1>🎙️ Voice Chat AI</h1>
