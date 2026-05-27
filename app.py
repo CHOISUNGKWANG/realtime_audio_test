@@ -7,7 +7,6 @@ from openai import AsyncOpenAI
 import streamlit as st
 from datetime import datetime
 import queue
-from threading import Thread
 
 # ========== 페이지 설정 ==========
 st.set_page_config(
@@ -16,6 +15,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ========== Streamlit Secrets에서 설정 읽기 ==========
+try:
+    REAL_ENDPOINT = st.secrets["real_endpoint"]
+    REAL_APIKEY = st.secrets["real_apikey"]
+    REAL_DEPLOYMENT = st.secrets["real_deployment"]
+except KeyError as e:
+    st.error(f"❌ Streamlit secrets 설정 오류: {e}")
+    st.error("💡 .streamlit/secrets.toml 파일에 다음을 추가하세요:")
+    st.code("""
+real_endpoint = 'https://your-resource.openai.azure.com/'
+real_apikey = 'your_api_key'
+real_deployment = 'gpt-4-realtime-preview'
+    """)
+    st.stop()
 
 # ========== CSS 스타일링 ==========
 st.markdown("""
@@ -159,6 +173,14 @@ st.markdown("""
         color: #666;
         font-size: 16px;
     }
+    
+    .settings-box {
+        background: #f0f4ff;
+        border-left: 4px solid #667eea;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -169,6 +191,8 @@ if "is_recording" not in st.session_state:
     st.session_state.is_recording = False
 if "status" not in st.session_state:
     st.session_state.status = "대기 중..."
+if "connection" not in st.session_state:
+    st.session_state.connection = None
 
 # ========== 오디오 설정 ==========
 SAMPLE_RATE = 24000
@@ -181,17 +205,20 @@ speaker_buffer = bytearray()
 is_ai_speaking = False
 current_ai_transcript = ""
 
-def mic_callback(indata, frames, time_info, status, loop):
+def mic_callback(indata, frames, time_info, status):
     """마이크 입력 콜백"""
     if status:
-        st.warning(f"🎤 마이크 입력 경고: {status}")
+        pass  # 에러 무시
     
     global is_ai_speaking
     if is_ai_speaking:
         return
         
     pcm_bytes = indata.tobytes()
-    mic_queue.put(pcm_bytes)
+    try:
+        mic_queue.put_nowait(pcm_bytes)
+    except queue.Full:
+        pass
 
 def speaker_callback(outdata, frames, time_info, status):
     """스피커 출력 콜백"""
@@ -223,7 +250,7 @@ async def send_mic_audio(connection):
         except queue.Empty:
             await asyncio.sleep(0.01)
         except Exception as e:
-            st.error(f"마이크 입력 에러: {e}")
+            st.error(f"❌ 마이크 입력 에러: {e}")
             break
 
 async def receive_server_audio(connection):
@@ -243,7 +270,8 @@ async def receive_server_audio(connection):
                     "content": user_text,
                     "timestamp": datetime.now().strftime("%H:%M:%S")
                 })
-                st.session_state.status = "AI가 생각 중..."
+                st.session_state.status = "🤖 AI가 생각 중..."
+                st.rerun()
             
         elif event.type == "response.output_audio_transcript.delta":
             current_ai_transcript += event.delta
@@ -258,63 +286,74 @@ async def receive_server_audio(connection):
                 })
             current_ai_transcript = ""
             st.session_state.status = "🎤 청취 중..."
+            st.rerun()
             
         elif event.type == "error":
-            st.error(f"서버 에러: {event.error.message}")
+            st.error(f"❌ 서버 에러: {event.error.message}")
+            st.session_state.is_recording = False
+            break
 
-async def run_voice_chat(endpoint, deployment_name, token):
+async def run_voice_chat():
     """음성채팅 실행"""
-    base_url = endpoint.replace("https://", "wss://").rstrip("/") + "/openai/v1"
-    client = AsyncOpenAI(websocket_base_url=base_url, api_key=token)
-
-    mic_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, 
-        channels=CHANNELS, 
-        dtype='int16', 
-        blocksize=CHUNK_SIZE,
-        callback=mic_callback
-    )
+    base_url = REAL_ENDPOINT.replace("https://", "wss://").rstrip("/") + "/openai/v1"
     
-    speaker_stream = sd.OutputStream(
-        samplerate=SAMPLE_RATE, 
-        channels=CHANNELS, 
-        dtype='int16',
-        blocksize=CHUNK_SIZE,
-        callback=speaker_callback
-    )
+    try:
+        client = AsyncOpenAI(websocket_base_url=base_url, api_key=REAL_APIKEY)
 
-    with mic_stream, speaker_stream:
-        async with client.realtime.connect(model=deployment_name) as connection:
-            await connection.session.update(
-                session={
-                    "type": "realtime",
-                    "instructions": "당신은 친절하고 자연스럽게 대화하는 AI 도우미입니다. 모든 답변은 한국어로 간결하고 대화하듯이 친숙하게 하세요.",
-                    "output_modalities": ["audio"],
-                    "audio": {
-                        "input": {
-                            "transcription": {"model": "whisper-1"},
-                            "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.7,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 1000, 
-                                "create_response": True,
-                                "interrupt_response": True 
+        mic_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, 
+            channels=CHANNELS, 
+            dtype='int16', 
+            blocksize=CHUNK_SIZE,
+            callback=mic_callback
+        )
+        
+        speaker_stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE, 
+            channels=CHANNELS, 
+            dtype='int16',
+            blocksize=CHUNK_SIZE,
+            callback=speaker_callback
+        )
+
+        with mic_stream, speaker_stream:
+            async with client.realtime.connect(model=REAL_DEPLOYMENT) as connection:
+                await connection.session.update(
+                    session={
+                        "type": "realtime",
+                        "instructions": "당신은 친절하고 자연스럽게 대화하는 AI 도우미입니다. 모든 답변은 한국어로 간결하고 대화하듯이 친숙하게 하세요.",
+                        "output_modalities": ["audio"],
+                        "audio": {
+                            "input": {
+                                "transcription": {"model": "whisper-1"},
+                                "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "threshold": 0.7,
+                                    "prefix_padding_ms": 300,
+                                    "silence_duration_ms": 1000, 
+                                    "create_response": True,
+                                    "interrupt_response": True 
+                                },
+                            },
+                            "output": {
+                                "voice": "alloy",
+                                "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
                             },
                         },
-                        "output": {
-                            "voice": "alloy",
-                            "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
-                        },
-                    },
-                }
-            )
+                    }
+                )
 
-            await asyncio.gather(
-                send_mic_audio(connection),
-                receive_server_audio(connection)
-            )
+                st.session_state.status = "🎤 청취 중..."
+                st.rerun()
+
+                await asyncio.gather(
+                    send_mic_audio(connection),
+                    receive_server_audio(connection)
+                )
+    except Exception as e:
+        st.error(f"❌ 연결 에러: {e}")
+        st.session_state.is_recording = False
 
 # ========== Streamlit UI ==========
 st.markdown("""
@@ -324,37 +363,24 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ========== 설정 섹션 ==========
-with st.expander("⚙️ 설정", expanded=False):
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        endpoint = st.text_input(
-            "Azure Endpoint",
-            value="",
-            placeholder="https://your-resource.openai.azure.com/"
-        )
-    
-    with col2:
-        deployment = st.text_input(
-            "Deployment Name",
-            value="gpt-4-realtime-preview",
-            placeholder="gpt-4-realtime-preview"
-        )
-    
-    with col3:
-        api_key = st.text_input(
-            "API Key",
-            type="password",
-            placeholder="Enter your API key"
-        )
+# ========== 설정 정보 ==========
+st.markdown(f"""
+<div class="settings-box">
+    <p>✅ <b>Azure 설정 로드됨</b></p>
+    <ul style="margin-left: 20px;">
+        <li>🔗 Endpoint: {REAL_ENDPOINT.split('.')[0]}...</li>
+        <li>🤖 Deployment: {REAL_DEPLOYMENT}</li>
+        <li>🔑 API Key: {REAL_APIKEY[:10]}...{REAL_APIKEY[-5:]}</li>
+    </ul>
+</div>
+""", unsafe_allow_html=True)
 
 # ========== 상태 표시 ==========
 col1, col2, col3 = st.columns([1, 2, 1])
 
 with col1:
-    status_color = "🟢" if st.session_state.is_recording else "⚪"
-    st.markdown(f"**상태:** {status_color} {st.session_state.status}")
+    status_emoji = "🟢" if st.session_state.is_recording else "⚪"
+    st.markdown(f"**상태:** {status_emoji} {st.session_state.status}")
 
 with col3:
     if st.session_state.is_recording:
@@ -364,17 +390,16 @@ with col3:
             st.rerun()
     else:
         if st.button("🎤 시작", use_container_width=True, key="start_btn"):
-            if not endpoint or not api_key:
-                st.error("⚠️ Azure 설정을 먼저 입력하세요")
-            else:
-                st.session_state.is_recording = True
-                st.session_state.status = "🎤 청취 중..."
-                
-                try:
-                    asyncio.run(run_voice_chat(endpoint, deployment, api_key))
-                except Exception as e:
-                    st.error(f"❌ 에러: {e}")
-                    st.session_state.is_recording = False
+            st.session_state.is_recording = True
+            st.session_state.status = "🎤 청취 중..."
+            
+            try:
+                asyncio.run(run_voice_chat())
+            except KeyboardInterrupt:
+                st.session_state.is_recording = False
+            except Exception as e:
+                st.error(f"❌ 에러: {e}")
+                st.session_state.is_recording = False
 
 # ========== 채팅 영역 ==========
 st.markdown("### 💬 대화 기록")
@@ -390,7 +415,7 @@ with chat_container:
                     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
                                 color: white; padding: 12px 16px; border-radius: 15px 15px 0px 15px;
                                 display: inline-block; max-width: 80%; word-wrap: break-word;">
-                        <b>You</b><br/>
+                        <b>👤 You</b><br/>
                         {message['content']}
                         <br/>
                         <span style="font-size: 0.75rem; opacity: 0.8;">{message['timestamp']}</span>
@@ -403,7 +428,7 @@ with chat_container:
                     <div style="background: #e9ecef; color: #333; padding: 12px 16px; 
                                 border-radius: 15px 15px 15px 0px; display: inline-block; 
                                 max-width: 80%; word-wrap: break-word;">
-                        <b>AI</b><br/>
+                        <b>🤖 AI</b><br/>
                         {message['content']}
                         <br/>
                         <span style="font-size: 0.75rem; opacity: 0.7;">{message['timestamp']}</span>
@@ -424,15 +449,15 @@ st.markdown("---")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.metric("총 메시지", len(st.session_state.messages))
+    st.metric("📊 총 메시지", len(st.session_state.messages))
 
 with col2:
     user_msgs = len([m for m in st.session_state.messages if m["role"] == "user"])
-    st.metric("사용자 메시지", user_msgs)
+    st.metric("👤 사용자 메시지", user_msgs)
 
 with col3:
     ai_msgs = len([m for m in st.session_state.messages if m["role"] == "ai"])
-    st.metric("AI 메시지", ai_msgs)
+    st.metric("🤖 AI 메시지", ai_msgs)
 
 # ========== 하단 정보 ==========
 st.markdown("""
@@ -440,5 +465,6 @@ st.markdown("""
 <div style="text-align: center; color: #999; font-size: 0.85rem; padding: 20px;">
     <p>💡 마이크에 명확하게 말씀하고, 말을 마친 후 1초 침묵하면 AI가 응답합니다</p>
     <p>🔒 모든 대화는 Azure OpenAI Realtime API를 통해 처리됩니다</p>
+    <p style="margin-top: 10px; font-size: 0.75rem;">설정: .streamlit/secrets.toml</p>
 </div>
 """, unsafe_allow_html=True)
