@@ -1,137 +1,444 @@
 import os
-import io
 import base64
 import asyncio
-import streamlit as st
+import numpy as np
+import sounddevice as sd
 from openai import AsyncOpenAI
-from pydub import AudioSegment
-from streamlit_mic_recorder import mic_recorder
+import streamlit as st
+from datetime import datetime
+import queue
+from threading import Thread
 
-# 1. 페이지 설정 및 UI 구성
-st.set_page_config(page_title="Azure Realtime Voice Chat", page_icon="🎙️", layout="centered")
-st.title("🎙️ Azure Realtime 웹 음성 비서")
-st.caption("웹 브라우저의 마이크를 이용해 대화하는 챗봇입니다.")
-
-# 세션 상태 초기화
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-# 가상의 이벤트 루프 생성 함수 (스트림릿 클라우드 비동기 대응용)
-def get_or_create_loop():
-    try:
-        return asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
-
-# 2. 오디오 규격 변환 및 Azure Realtime API 통신 함수
-async def process_voice_chat(audio_bytes):
-    # Streamlit Secrets에서 보안 환경 변수 로드
-    endpoint = st.secrets["REAL_ENDPOINT"]
-    deployment_name = st.secrets["REAL_DEPLOYMENT"]
-    token = st.secrets["REAL_APIKEY"]
-    base_url = endpoint.replace("https://", "wss://").rstrip("/") + "/openai/v1"
-
-    client = AsyncOpenAI(websocket_base_url=base_url, api_key=token)
-
-    # 💡 [무한 로딩 해결 핵심] 브라우저의 WAV 바이너리를 Azure 표준(PCM 24kHz, Mono)으로 변환
-    try:
-        audio_stream = io.BytesIO(audio_bytes)
-        sound = AudioSegment.from_file(audio_stream, format="wav")
-        # 24000Hz, 모노(1채널)로 변환 후 날것의 PCM 바이트 데이터 추출
-        sound = sound.set_frame_rate(24000).set_channels(1)
-        pcm_payload = sound.raw_data  # 헤더가 제거된 순수 PCM 데이터
-    except Exception as e:
-        st.error(f"오디오 변환 실패: {e}")
-        return "오디오 변환 실패", "오디오 변환 실패", b""
-
-    async with client.realtime.connect(model=deployment_name) as connection:
-        # 세션 포맷 세팅 (인풋 포맷을 변환 규격인 pcm 24kHz로 지정)
-        await connection.session.update(
-            session={
-                "type": "realtime",
-                "instructions": "당신은 친절한 AI 도우미입니다. 모든 답변은 한국어로 간결하고 대화하듯이 친숙하게 하세요.",
-                "output_modalities": ["audio", "text"], 
-                "audio": {
-                    "input": {
-                        "transcription": {"model": "whisper-1"},
-                        "format": {"type": "audio/pcm", "rate": 24000}
-                    },
-                    "output": {
-                        "voice": "alloy",
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                    },
-                },
-            }
-        )
-
-        # 변환이 완료된 순수 PCM 데이터를 Base64로 인코딩하여 전송
-        b64_audio = base64.b64encode(pcm_payload).decode()
-        await connection.input_audio_buffer.append(audio=b64_audio)
-        
-        # 서버에 오디오 입력이 끝났음을 전송하고 대답 트리거
-        await connection.input_audio_buffer.commit()
-        await connection.response.create()
-
-        user_transcript = ""
-        ai_transcript = ""
-        ai_audio_chunks = bytearray()
-
-        # 서버 응답 이벤트 수신 루프 (규격이 맞기 때문에 무한 로딩 없이 통과됩니다)
-        async for event in connection:
-            if event.type == "conversation.item.input_audio_transcription.completed":
-                user_transcript = event.transcript.strip()
-            elif event.type == "response.output_audio_transcript.delta":
-                ai_transcript += event.delta
-            elif event.type == "response.output_audio.delta":
-                ai_audio_chunks.extend(base64.b64decode(event.delta))
-            elif event.type == "response.done":
-                break
-
-        return user_transcript, ai_transcript, bytes(ai_audio_chunks)
-
-# --- UI 레이아웃 화면 구성 ---
-
-st.write("### 🎛️ 마이크 컨트롤러")
-st.write("아래 버튼을 누르고 말씀하신 뒤, 완료되면 다시 눌러주세요.")
-
-# 스트림릿 전용 웹 마이크 컴포넌트 렌더링
-audio_result = mic_recorder(
-    start_prompt="🔴 녹음 시작",
-    stop_prompt="⏹️ 녹음 완료 및 전송",
-    key="recorder",
-    format="wav"
+# ========== 페이지 설정 ==========
+st.set_page_config(
+    page_title="🎙️ Voice Chat AI",
+    page_icon="🎙️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# 사용자가 녹음을 완료하여 오디오 데이터가 웹 서버로 입수되었을 때
-if audio_result and "bytes" in audio_result:
-    with st.spinner("AI가 청취 중..."):
-        loop = get_or_create_loop()
-        # 비동기 함수 실행 및 결과 도출
-        user_text, ai_text, ai_audio = loop.run_until_complete(
-            process_voice_chat(audio_result["bytes"])
-        )
-        
-        # 정상적으로 변환된 대화 텍스트가 있다면 세션에 기록
-        if user_text or ai_text:
-            st.session_state.chat_history.append({
-                "user": user_text if user_text else "(음성 인식 완료)",
-                "ai": ai_text,
-                "ai_audio": ai_audio
-            })
-            # 오디오 무한 중복 처리를 방지하기 위해 화면 리프레시
-            st.rerun()
+# ========== CSS 스타일링 ==========
+st.markdown("""
+<style>
+    * {
+        margin: 0;
+        padding: 0;
+    }
+    
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+    }
+    
+    .main {
+        background: white;
+        border-radius: 20px;
+        padding: 0;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    }
+    
+    .chat-container {
+        height: 600px;
+        overflow-y: auto;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 15px;
+        margin-bottom: 20px;
+    }
+    
+    .message {
+        margin-bottom: 15px;
+        padding: 12px 16px;
+        border-radius: 10px;
+        max-width: 80%;
+        word-wrap: break-word;
+    }
+    
+    .user-message {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        margin-left: auto;
+        text-align: right;
+        border-radius: 15px 15px 0px 15px;
+    }
+    
+    .ai-message {
+        background: #e9ecef;
+        color: #333;
+        margin-right: auto;
+        border-radius: 15px 15px 15px 0px;
+    }
+    
+    .timestamp {
+        font-size: 0.75rem;
+        opacity: 0.7;
+        margin-top: 5px;
+    }
+    
+    .status-indicator {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 8px;
+        animation: pulse 2s infinite;
+    }
+    
+    .status-listening {
+        background-color: #4CAF50;
+    }
+    
+    .status-processing {
+        background-color: #FFC107;
+    }
+    
+    .status-idle {
+        background-color: #999;
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    
+    .control-button {
+        padding: 12px 24px;
+        border-radius: 10px;
+        border: none;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+    }
+    
+    .btn-primary {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+    
+    .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+    }
+    
+    .btn-danger {
+        background: #ff6b6b;
+        color: white;
+    }
+    
+    .btn-danger:hover {
+        background: #ff5252;
+        transform: translateY(-2px);
+    }
+    
+    .info-box {
+        background: #e3f2fd;
+        border-left: 4px solid #2196F3;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
+    
+    .title-section {
+        text-align: center;
+        margin-bottom: 30px;
+        padding: 20px 0;
+    }
+    
+    .title-section h1 {
+        font-size: 48px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 10px;
+    }
+    
+    .title-section p {
+        color: #666;
+        font-size: 16px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# 대화창 및 오디오 플레이어 출력 (최신 대화가 아래로 가도록 순서대로 출력)
-st.write("---")
-for chat in st.session_state.chat_history:
-    # 유저 말풍선
-    with st.chat_message("user"):
-        st.write(chat["user"])
-    # AI 말풍선
-    with st.chat_message("assistant"):
-        st.write(chat["ai"])
-        if chat["ai_audio"]:
-            # 스트림릿 플레이어를 통해 브라우저 스피커로 AI의 정속 목소리를 재생합니다.
-            st.audio(chat["ai_audio"], format="audio/pcm", sample_rate=24000)
+# ========== Streamlit 세션 상태 초기화 ==========
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "is_recording" not in st.session_state:
+    st.session_state.is_recording = False
+if "status" not in st.session_state:
+    st.session_state.status = "대기 중..."
+
+# ========== 오디오 설정 ==========
+SAMPLE_RATE = 24000
+CHANNELS = 1
+CHUNK_SIZE = 2400
+
+# ========== 전역 변수 ==========
+mic_queue = queue.Queue()
+speaker_buffer = bytearray()
+is_ai_speaking = False
+current_ai_transcript = ""
+
+def mic_callback(indata, frames, time_info, status, loop):
+    """마이크 입력 콜백"""
+    if status:
+        st.warning(f"🎤 마이크 입력 경고: {status}")
+    
+    global is_ai_speaking
+    if is_ai_speaking:
+        return
+        
+    pcm_bytes = indata.tobytes()
+    mic_queue.put(pcm_bytes)
+
+def speaker_callback(outdata, frames, time_info, status):
+    """스피커 출력 콜백"""
+    global is_ai_speaking, speaker_buffer
+    
+    required_bytes = frames * CHANNELS * 2
+    if len(speaker_buffer) >= required_bytes:
+        data = speaker_buffer[:required_bytes]
+        del speaker_buffer[:required_bytes]
+        
+        outdata[:] = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS)
+        is_ai_speaking = True
+    else:
+        outdata.fill(0)
+        is_ai_speaking = False
+
+async def send_mic_audio(connection):
+    """마이크 입력 전송"""
+    global is_ai_speaking
+    while st.session_state.is_recording:
+        try:
+            pcm_bytes = mic_queue.get(timeout=0.1)
+            
+            if is_ai_speaking:
+                continue
+                
+            b64_audio = base64.b64encode(pcm_bytes).decode()
+            await connection.input_audio_buffer.append(audio=b64_audio)
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+        except Exception as e:
+            st.error(f"마이크 입력 에러: {e}")
+            break
+
+async def receive_server_audio(connection):
+    """서버 응답 수신"""
+    global speaker_buffer, current_ai_transcript
+    
+    async for event in connection:
+        if event.type == "response.output_audio.delta":
+            audio_chunk = base64.b64decode(event.delta)
+            speaker_buffer.extend(audio_chunk)
+                
+        elif event.type == "conversation.item.input_audio_transcription.completed":
+            user_text = event.transcript.strip()
+            if user_text:
+                st.session_state.messages.append({
+                    "role": "user",
+                    "content": user_text,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                })
+                st.session_state.status = "AI가 생각 중..."
+            
+        elif event.type == "response.output_audio_transcript.delta":
+            current_ai_transcript += event.delta
+
+        elif event.type == "response.done":
+            ai_text = current_ai_transcript.strip()
+            if ai_text:
+                st.session_state.messages.append({
+                    "role": "ai",
+                    "content": ai_text,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                })
+            current_ai_transcript = ""
+            st.session_state.status = "🎤 청취 중..."
+            
+        elif event.type == "error":
+            st.error(f"서버 에러: {event.error.message}")
+
+async def run_voice_chat(endpoint, deployment_name, token):
+    """음성채팅 실행"""
+    base_url = endpoint.replace("https://", "wss://").rstrip("/") + "/openai/v1"
+    client = AsyncOpenAI(websocket_base_url=base_url, api_key=token)
+
+    mic_stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, 
+        channels=CHANNELS, 
+        dtype='int16', 
+        blocksize=CHUNK_SIZE,
+        callback=mic_callback
+    )
+    
+    speaker_stream = sd.OutputStream(
+        samplerate=SAMPLE_RATE, 
+        channels=CHANNELS, 
+        dtype='int16',
+        blocksize=CHUNK_SIZE,
+        callback=speaker_callback
+    )
+
+    with mic_stream, speaker_stream:
+        async with client.realtime.connect(model=deployment_name) as connection:
+            await connection.session.update(
+                session={
+                    "type": "realtime",
+                    "instructions": "당신은 친절하고 자연스럽게 대화하는 AI 도우미입니다. 모든 답변은 한국어로 간결하고 대화하듯이 친숙하게 하세요.",
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {
+                            "transcription": {"model": "whisper-1"},
+                            "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.7,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 1000, 
+                                "create_response": True,
+                                "interrupt_response": True 
+                            },
+                        },
+                        "output": {
+                            "voice": "alloy",
+                            "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                        },
+                    },
+                }
+            )
+
+            await asyncio.gather(
+                send_mic_audio(connection),
+                receive_server_audio(connection)
+            )
+
+# ========== Streamlit UI ==========
+st.markdown("""
+<div class="title-section">
+    <h1>🎙️ Voice Chat AI</h1>
+    <p>실시간 음성으로 AI와 대화하세요</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ========== 설정 섹션 ==========
+with st.expander("⚙️ 설정", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        endpoint = st.text_input(
+            "Azure Endpoint",
+            value="",
+            placeholder="https://your-resource.openai.azure.com/"
+        )
+    
+    with col2:
+        deployment = st.text_input(
+            "Deployment Name",
+            value="gpt-4-realtime-preview",
+            placeholder="gpt-4-realtime-preview"
+        )
+    
+    with col3:
+        api_key = st.text_input(
+            "API Key",
+            type="password",
+            placeholder="Enter your API key"
+        )
+
+# ========== 상태 표시 ==========
+col1, col2, col3 = st.columns([1, 2, 1])
+
+with col1:
+    status_color = "🟢" if st.session_state.is_recording else "⚪"
+    st.markdown(f"**상태:** {status_color} {st.session_state.status}")
+
+with col3:
+    if st.session_state.is_recording:
+        if st.button("⏹️ 종료", use_container_width=True, key="stop_btn"):
+            st.session_state.is_recording = False
+            st.session_state.status = "대기 중..."
+            st.rerun()
+    else:
+        if st.button("🎤 시작", use_container_width=True, key="start_btn"):
+            if not endpoint or not api_key:
+                st.error("⚠️ Azure 설정을 먼저 입력하세요")
+            else:
+                st.session_state.is_recording = True
+                st.session_state.status = "🎤 청취 중..."
+                
+                try:
+                    asyncio.run(run_voice_chat(endpoint, deployment, api_key))
+                except Exception as e:
+                    st.error(f"❌ 에러: {e}")
+                    st.session_state.is_recording = False
+
+# ========== 채팅 영역 ==========
+st.markdown("### 💬 대화 기록")
+
+chat_container = st.container(border=True)
+
+with chat_container:
+    if st.session_state.messages:
+        for message in st.session_state.messages:
+            if message["role"] == "user":
+                st.markdown(f"""
+                <div style="text-align: right; margin-bottom: 10px;">
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                color: white; padding: 12px 16px; border-radius: 15px 15px 0px 15px;
+                                display: inline-block; max-width: 80%; word-wrap: break-word;">
+                        <b>You</b><br/>
+                        {message['content']}
+                        <br/>
+                        <span style="font-size: 0.75rem; opacity: 0.8;">{message['timestamp']}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="text-align: left; margin-bottom: 10px;">
+                    <div style="background: #e9ecef; color: #333; padding: 12px 16px; 
+                                border-radius: 15px 15px 15px 0px; display: inline-block; 
+                                max-width: 80%; word-wrap: break-word;">
+                        <b>AI</b><br/>
+                        {message['content']}
+                        <br/>
+                        <span style="font-size: 0.75rem; opacity: 0.7;">{message['timestamp']}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="text-align: center; color: #999; padding: 40px;">
+            <h3>아직 메시지가 없습니다</h3>
+            <p>🎤 시작 버튼을 눌러 음성 채팅을 시작하세요</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ========== 정보 섹션 ==========
+st.markdown("---")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric("총 메시지", len(st.session_state.messages))
+
+with col2:
+    user_msgs = len([m for m in st.session_state.messages if m["role"] == "user"])
+    st.metric("사용자 메시지", user_msgs)
+
+with col3:
+    ai_msgs = len([m for m in st.session_state.messages if m["role"] == "ai"])
+    st.metric("AI 메시지", ai_msgs)
+
+# ========== 하단 정보 ==========
+st.markdown("""
+---
+<div style="text-align: center; color: #999; font-size: 0.85rem; padding: 20px;">
+    <p>💡 마이크에 명확하게 말씀하고, 말을 마친 후 1초 침묵하면 AI가 응답합니다</p>
+    <p>🔒 모든 대화는 Azure OpenAI Realtime API를 통해 처리됩니다</p>
+</div>
+""", unsafe_allow_html=True)
