@@ -93,9 +93,9 @@ async def receive_server_audio(connection):
 # 대화 시작 통합 비동기 함수
 async def start_realtime_session():
     # 환경 변수 로드 (사용자 환경 변수 명칭 유지)
-    endpoint = real_endpoint
-    deployment_name = real_deployment
-    token = real_apikey
+    endpoint = st.secrets["REAL_ENDPOINT"]
+    deployment_name = st.secrets["REAL_DEPLOYMENT"]
+    token = st.secrets["REAL_APIKEY"]
     base_url = endpoint.replace("https://", "wss://").rstrip("/") + "/openai/v1"
 
     client = AsyncOpenAI(websocket_base_url=base_url, api_key=token)
